@@ -51,6 +51,9 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("HF_HOME", "/tmp/huggingface_cache")
+# Defragments VRAM so PyTorch doesn't leave large unusable gaps between tensors.
+# Prevents OOM even when free VRAM looks sufficient on paper.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import gc

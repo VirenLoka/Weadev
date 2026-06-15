@@ -59,8 +59,10 @@ model:
 # ------------------------------------------------------------------
 processing:
   # Number of chunks fed to model.encode() in one call.
-  # Raise if nvidia-smi shows spare VRAM (try 512 or 1024 on H200).
-  batch_size: 256
+  # Activation memory scales with batch_size * seq_len^2, so this matters more
+  # than model size. Start at 32 and raise (64 -> 128 -> 256) only after
+  # confirming nvidia-smi shows headroom during the first flush.
+  batch_size: 32
 
   # Chunks buffered in RAM before a encode+write flush happens.
   # Controls peak host memory usage. 4096 is safe for most setups.
