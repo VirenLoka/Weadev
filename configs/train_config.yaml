@@ -6,7 +6,7 @@
 # Input
 # ------------------------------------------------------------------
 input:
-  parquet_path: "weadev/financial_reports_dataset/main/train_full.parquet"
+  parquet_path: "financial_reports_dataset/main/train_full.parquet"
 
   # Set to an integer to limit processing to the first N company rows.
   # Useful for smoke-testing before a full run. null = process all rows.
@@ -48,6 +48,11 @@ model:
   max_seq_length: 32768
   normalize_embeddings: true
   trust_remote_code: true
+
+  # Maps weights straight Disk -> GPU VRAM, bypassing the host-RAM buffer that
+  # causes 'Killed' crashes on RAM-capped containers. Set to null to disable
+  # (falls back to the normal Disk -> RAM -> VRAM path).
+  device_map: "cuda:0"
 
 # ------------------------------------------------------------------
 # Processing / batching

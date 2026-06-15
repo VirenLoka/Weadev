@@ -43,11 +43,14 @@ import os
 # numpy / pyarrow / torch — those libraries read these env vars at import time.
 # setdefault means a value you export in the shell still wins.
 # --------------------------------------------------------------------------
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
-os.environ.setdefault("OMP_NUM_THREADS", "4")
-os.environ.setdefault("MKL_NUM_THREADS", "4")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("HF_HOME", "hf_temp/")
+# Force CPU multiprocessing libraries to a single thread to prevent 'loky'
+# semaphore leaks and host-RAM spikes. Hard-set (not setdefault) so a stray
+# value inherited from the container can't keep the leak alive.
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.setdefault("HF_HOME", "/tmp/huggingface_cache")
 
 import argparse
 import gc
@@ -144,7 +147,8 @@ def parse_args() -> argparse.Namespace:
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model(model_name: str, max_seq_length: int, dtype_str: str, trust_remote_code: bool):
+def load_model(model_name: str, max_seq_length: int, dtype_str: str,
+               trust_remote_code: bool, device_map: str | None):
     import torch
     from sentence_transformers import SentenceTransformer
 
@@ -155,18 +159,26 @@ def load_model(model_name: str, max_seq_length: int, dtype_str: str, trust_remot
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map.get(dtype_str, torch.bfloat16)
 
-    print(f"\nLoading {model_name} directly onto GPU with low host-RAM routing...")
+    # device_map maps weights straight Disk -> GPU VRAM, bypassing the host-RAM
+    # buffer entirely. This is what avoids the 'Killed' crash on RAM-capped
+    # containers (e.g. jovyan) when loading the 15 GB / multi-shard checkpoint.
+    model_kwargs = {
+        "torch_dtype": torch_dtype,
+        "low_cpu_mem_usage": True,
+    }
+    if device_map:
+        model_kwargs["device_map"] = device_map
+
+    print(f"\nBypassing system RAM: forcing direct-to-GPU instantiation "
+          f"(device_map={device_map})...")
     model = SentenceTransformer(
         model_name,
         trust_remote_code=trust_remote_code,
-        model_kwargs={
-            "torch_dtype": torch_dtype,
-            "low_cpu_mem_usage": True,  # prevents the host-RAM 'Killed' crash
-        },
+        model_kwargs=model_kwargs,
     )
     model.max_seq_length = max_seq_length
     model.tokenizer.padding_side = "right"
-    print("Model successfully loaded.")
+    print("Model successfully loaded directly to GPU.")
     return model
 
 
@@ -322,6 +334,7 @@ def main() -> int:
     max_seq_length  = _deep_get(cfg, "model", "max_seq_length", default=32768)
     normalize       = _deep_get(cfg, "model", "normalize_embeddings", default=True)
     trust_rc        = _deep_get(cfg, "model", "trust_remote_code", default=True)
+    device_map      = _deep_get(cfg, "model", "device_map", default="cuda:0")
     batch_size      = _deep_get(cfg, "processing", "batch_size", default=256)
     flush_size      = _deep_get(cfg, "processing", "flush_size", default=4096)
     read_batch_size = _deep_get(cfg, "processing", "read_batch_size", default=16)
@@ -355,7 +368,7 @@ def main() -> int:
     table = db.create_table(table_name, schema=schema, mode=write_mode)
     print(f"Table '{table_name}' ready (mode={write_mode}).")
 
-    model = load_model(model_name, max_seq_length, dtype_str, trust_rc)
+    model = load_model(model_name, max_seq_length, dtype_str, trust_rc, device_map)
 
     # Stream the parquet in small row batches so the full dataset is never
     # held in host RAM at once.
