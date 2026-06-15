@@ -61,6 +61,11 @@ processing:
   # Controls peak host memory usage. 4096 is safe for most setups.
   flush_size: 4096
 
+  # Number of parquet (company) rows read into host RAM per streaming batch.
+  # Each company row can hold many large filings, so keep this small to keep
+  # host memory low. Raise only if rows are small and you want fewer reads.
+  read_batch_size: 16
+
   # Chunks shorter than this (after strip) are skipped.
   min_chars: 1
 
