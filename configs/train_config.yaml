@@ -1,0 +1,76 @@
+# ============================================================
+# embed_filings.py — training / embedding configuration
+# ============================================================
+
+# ------------------------------------------------------------------
+# Input
+# ------------------------------------------------------------------
+input:
+  parquet_path: "weadev/financial_reports_dataset/main/train_full.parquet"
+
+  # Set to an integer to limit processing to the first N company rows.
+  # Useful for smoke-testing before a full run. null = process all rows.
+  limit_rows: null
+
+# ------------------------------------------------------------------
+# Report sections to embed (all 20 10-K sections by default).
+# Remove any you want to skip to save time / space.
+# ------------------------------------------------------------------
+sections:
+  - section_1
+  - section_1A
+  - section_1B
+  - section_2
+  - section_3
+  - section_4
+  - section_5
+  - section_6
+  - section_7
+  - section_7A
+  - section_8
+  - section_9
+  - section_9A
+  - section_9B
+  - section_10
+  - section_11
+  - section_12
+  - section_13
+  - section_14
+  - section_15
+
+# ------------------------------------------------------------------
+# Embedding model
+# ------------------------------------------------------------------
+model:
+  name: "nvidia/NV-Embed-v2"
+  embed_dim: 4096
+  dtype: "bfloat16"          # passed to torch_dtype; "float16" also valid
+  max_seq_length: 32768
+  normalize_embeddings: true
+  trust_remote_code: true
+
+# ------------------------------------------------------------------
+# Processing / batching
+# ------------------------------------------------------------------
+processing:
+  # Number of chunks fed to model.encode() in one call.
+  # Raise if nvidia-smi shows spare VRAM (try 512 or 1024 on H200).
+  batch_size: 256
+
+  # Chunks buffered in RAM before a encode+write flush happens.
+  # Controls peak host memory usage. 4096 is safe for most setups.
+  flush_size: 4096
+
+  # Chunks shorter than this (after strip) are skipped.
+  min_chars: 1
+
+# ------------------------------------------------------------------
+# Output — LanceDB vector database
+# ------------------------------------------------------------------
+output:
+  lancedb_path: "lancedb/"
+  table_name: "filings_sections"
+
+  # "overwrite" rebuilds the table on each run (safe default).
+  # "append" adds to an existing table (useful for multi-shard ingestion).
+  write_mode: "overwrite"

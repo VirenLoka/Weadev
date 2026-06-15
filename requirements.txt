@@ -4,3 +4,4 @@ lancedb
 sentence-transformers
 torch
 numpy
+pyyaml
