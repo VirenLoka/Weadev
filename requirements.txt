@@ -1,0 +1,6 @@
+polars
+pyarrow
+lancedb
+sentence-transformers
+torch
+numpy
