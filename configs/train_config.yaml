@@ -42,7 +42,7 @@ sections:
 # Embedding model
 # ------------------------------------------------------------------
 model:
-  name: "nvidia/NV-Embed-v2"
+  name: "Hyukkyu/nv-embed-v2"
   embed_dim: 4096
   dtype: "bfloat16"          # passed to torch_dtype; "float16" also valid
   max_seq_length: 32768

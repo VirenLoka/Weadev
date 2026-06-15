@@ -153,7 +153,7 @@ def parse_args() -> argparse.Namespace:
 def load_model(model_name: str, max_seq_length: int, dtype_str: str,
                trust_remote_code: bool, device_map: str | None):
     import torch
-    from sentence_transformers import SentenceTransformer
+    from transformers import AutoModel
 
     assert torch.cuda.is_available(), "CUDA is not available! Check your drivers."
     print(f"Detected GPU: {torch.cuda.get_device_name(0)}")
@@ -162,33 +162,56 @@ def load_model(model_name: str, max_seq_length: int, dtype_str: str,
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map.get(dtype_str, torch.bfloat16)
 
+    # NV-Embed-v2 ships its own latent-attention pooling and returns sentence
+    # embeddings directly from its custom forward — the SentenceTransformer
+    # wrapper chokes on this (it expects a raw last_hidden_state to pool itself).
+    # We load the native AutoModel instead and use its built-in .encode(), which
+    # is exactly how NVIDIA designed the model to be consumed.
+    #
     # device_map maps weights straight Disk -> GPU VRAM, bypassing the host-RAM
     # buffer entirely. This is what avoids the 'Killed' crash on RAM-capped
     # containers (e.g. jovyan) when loading the 15 GB / multi-shard checkpoint.
     model_kwargs = {
         "torch_dtype": torch_dtype,
         "low_cpu_mem_usage": True,
+        "trust_remote_code": trust_remote_code,
     }
     if device_map:
         model_kwargs["device_map"] = device_map
 
     print(f"\nBypassing system RAM: forcing direct-to-GPU instantiation "
           f"(device_map={device_map})...")
-    model = SentenceTransformer(
-        model_name,
-        trust_remote_code=trust_remote_code,
-        model_kwargs=model_kwargs,
-    )
-    model.max_seq_length = max_seq_length
-    model.tokenizer.padding_side = "right"
+    model = AutoModel.from_pretrained(model_name, **model_kwargs)
+    model.eval()
+    # NV-Embed's native encode() handles EOS + padding internally; just make
+    # sure padding is right-side as the model expects.
+    if hasattr(model, "tokenizer") and model.tokenizer is not None:
+        model.tokenizer.padding_side = "right"
     print("Model successfully loaded directly to GPU.")
     return model
 
 
-def add_eos(model, texts: list[str]) -> list[str]:
-    """NV-Embed-v2 requires an explicit EOS token appended to each passage."""
-    eos = model.tokenizer.eos_token
-    return [t + eos for t in texts]
+def encode_passages(model, texts: list[str], batch_size: int,
+                    max_seq_length: int, normalize: bool) -> np.ndarray:
+    """Encode passages with NV-Embed-v2's native .encode(), in sub-batches.
+
+    The model appends EOS and runs its latent-attention pooling internally,
+    returning one sentence embedding per text. We chunk by batch_size to keep
+    VRAM bounded and move each chunk to host as float32 numpy immediately.
+    """
+    import torch
+
+    out: list[np.ndarray] = []
+    # Document/passage embeddings use an empty instruction prefix.
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        with torch.no_grad():
+            emb = model.encode(batch, instruction="", max_length=max_seq_length)
+        if normalize:
+            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+        out.append(emb.to(torch.float32).cpu().numpy())
+        del emb
+    return np.concatenate(out, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -293,17 +316,12 @@ def _to_arrow_table(embeddings: np.ndarray, metas: list[dict],
     return pa.table(columns, schema=schema)
 
 
-def flush_buffer(model, table, schema, embed_dim, batch_size, normalize,
-                 texts: list[str], metas: list[dict]) -> int:
+def flush_buffer(model, table, schema, embed_dim, batch_size, max_seq_length,
+                 normalize, texts: list[str], metas: list[dict]) -> int:
     if not texts:
         return 0
 
-    embeddings = model.encode(
-        add_eos(model, texts),
-        batch_size=batch_size,
-        show_progress_bar=True,
-        normalize_embeddings=normalize,
-    )
+    embeddings = encode_passages(model, texts, batch_size, max_seq_length, normalize)
 
     arrow_tbl = _to_arrow_table(embeddings, metas, schema, embed_dim)
     n = arrow_tbl.num_rows
@@ -398,8 +416,8 @@ def main() -> int:
                 meta_buf.append(meta)
                 if len(text_buf) >= flush_size:
                     total_written += flush_buffer(
-                        model, table, schema, embed_dim, batch_size, normalize,
-                        text_buf, meta_buf,
+                        model, table, schema, embed_dim, batch_size, max_seq_length,
+                        normalize, text_buf, meta_buf,
                     )
                     text_buf, meta_buf = [], []
                     print(f"  ... {total_written:,} chunks written so far")
@@ -410,7 +428,8 @@ def main() -> int:
 
     # Final flush.
     total_written += flush_buffer(
-        model, table, schema, embed_dim, batch_size, normalize, text_buf, meta_buf,
+        model, table, schema, embed_dim, batch_size, max_seq_length,
+        normalize, text_buf, meta_buf,
     )
 
     elapsed = time.time() - start
