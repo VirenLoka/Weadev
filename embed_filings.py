@@ -57,6 +57,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import gc
+import json
 import sys
 import time
 from pathlib import Path
@@ -66,6 +67,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
+from tqdm.auto import tqdm
 
 
 DEFAULT_CONFIG = "configs/train_config.yaml"
@@ -143,6 +145,10 @@ def parse_args() -> argparse.Namespace:
                    help="Override model.name.")
     p.add_argument("--limit-rows", dest="limit_rows", type=int, default=None,
                    help="Override input.limit_rows (first N company rows only).")
+    p.add_argument("--restart", action="store_true",
+                   help="Ignore any saved checkpoint, wipe the table, and start "
+                        "from row 0. Default is to resume where the last run "
+                        "left off.")
     return p.parse_args()
 
 
@@ -202,8 +208,10 @@ def encode_passages(model, texts: list[str], batch_size: int,
     import torch
 
     out: list[np.ndarray] = []
+    n_batches = (len(texts) + batch_size - 1) // batch_size
     # Document/passage embeddings use an empty instruction prefix.
-    for i in range(0, len(texts), batch_size):
+    for i in tqdm(range(0, len(texts), batch_size), total=n_batches,
+                  desc="  embedding", unit="batch", leave=False):
         batch = texts[i:i + batch_size]
         with torch.no_grad():
             emb = model.encode(batch, instruction="", max_length=max_seq_length)
@@ -334,6 +342,47 @@ def flush_buffer(model, table, schema, embed_dim, batch_size, max_seq_length,
 
 
 # ---------------------------------------------------------------------------
+# Resume / checkpoint state
+# ---------------------------------------------------------------------------
+#
+# The unit of progress is one company row from the parquet. We only ever flush
+# the buffer on a row boundary (never mid-row), so after a successful flush
+# every chunk for every row up to `completed_rows` is durably in LanceDB. That
+# invariant makes the checkpoint exact: on restart we skip the first
+# `completed_rows` rows and append the rest, with no duplicates and no gaps.
+
+def progress_path_for(lancedb_path: str, table_name: str) -> Path:
+    return Path(lancedb_path) / f"{table_name}.progress.json"
+
+
+def load_progress(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_progress(path: Path, *, completed_rows: int, total_written: int,
+                  parquet_path: str, parquet_size: int, table_name: str) -> None:
+    """Atomically write the checkpoint (temp file + os.replace)."""
+    payload = {
+        "completed_rows": completed_rows,
+        "total_written": total_written,
+        "parquet": parquet_path,
+        "parquet_size": parquet_size,
+        "table": table_name,
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)  # atomic on POSIX
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -384,57 +433,128 @@ def main() -> int:
 
     Path(lancedb_path).mkdir(parents=True, exist_ok=True)
     schema = lancedb_schema(embed_dim)
+    parquet_size = os.path.getsize(parquet_path)
+    prog_path = progress_path_for(lancedb_path, table_name)
+
     print(f"Connecting to LanceDB at: {lancedb_path}")
     db = lancedb.connect(lancedb_path)
-    table = db.create_table(table_name, schema=schema, mode=write_mode)
-    print(f"Table '{table_name}' ready (mode={write_mode}).")
+
+    # ---- decide resume vs. fresh start ------------------------------------
+    prog = load_progress(prog_path)
+    skip_rows = int(prog.get("completed_rows", 0))
+    total_written = int(prog.get("total_written", 0))
+    table_exists = table_name in db.table_names()
+    resuming = (
+        not args.restart
+        and skip_rows > 0
+        and table_exists
+    )
+
+    if resuming:
+        # Guard against silently appending to a checkpoint built from a
+        # different parquet — that would interleave two datasets.
+        if prog.get("parquet") != parquet_path or prog.get("parquet_size") != parquet_size:
+            print("ERROR: saved checkpoint was built from a different parquet "
+                  "file (path or size changed).", file=sys.stderr)
+            print(f"  checkpoint : {prog.get('parquet')} ({prog.get('parquet_size')} bytes)",
+                  file=sys.stderr)
+            print(f"  current    : {parquet_path} ({parquet_size} bytes)", file=sys.stderr)
+            print("Re-run with --restart to discard it and start over.", file=sys.stderr)
+            return 1
+        table = db.open_table(table_name)
+        print(f"Resuming: skipping {skip_rows:,} already-embedded company rows "
+              f"({total_written:,} chunks already in '{table_name}').")
+    else:
+        # Fresh start: wipe the table and reset the checkpoint.
+        table = db.create_table(table_name, schema=schema, mode="overwrite")
+        skip_rows = 0
+        total_written = 0
+        if prog_path.exists():
+            prog_path.unlink()
+        reason = "restart requested" if args.restart else f"mode={write_mode}"
+        print(f"Starting fresh: table '{table_name}' created ({reason}).")
 
     model = load_model(model_name, max_seq_length, dtype_str, trust_rc, device_map)
 
     # Stream the parquet in small row batches so the full dataset is never
     # held in host RAM at once.
-    print(f"\nStreaming parquet: {parquet_path}")
     pf = pq.ParquetFile(parquet_path)
+    # Total company rows in the file -> drives the tqdm bar + ETA.
+    total_rows = pf.metadata.num_rows
+    target_rows = min(total_rows, limit_rows) if limit_rows else total_rows
+    print(f"\nStreaming parquet: {parquet_path}  ({total_rows:,} company rows)")
 
     text_buf: list[str] = []
     meta_buf: list[dict] = []
-    total_written = 0
-    rows_seen = 0
+    rows_seen = 0          # absolute rows consumed from the parquet (incl. skipped)
     stop = False
     start = time.time()
 
-    for record_batch in pf.iter_batches(batch_size=read_batch_size):
-        rows = record_batch.to_pylist()
-        del record_batch
-        for row in rows:
-            if limit_rows and rows_seen >= limit_rows:
-                stop = True
-                break
-            rows_seen += 1
-            for text, meta in iter_chunks(row, sections, min_chars):
-                text_buf.append(text)
-                meta_buf.append(meta)
-                if len(text_buf) >= flush_size:
-                    total_written += flush_buffer(
-                        model, table, schema, embed_dim, batch_size, max_seq_length,
-                        normalize, text_buf, meta_buf,
-                    )
-                    text_buf, meta_buf = [], []
-                    print(f"  ... {total_written:,} chunks written so far")
-        del rows
-        gc.collect()
-        if stop:
-            break
+    def do_flush() -> None:
+        """Flush the buffer, persist the checkpoint, and update the bar."""
+        nonlocal total_written, text_buf, meta_buf
+        if not text_buf:
+            return
+        total_written += flush_buffer(
+            model, table, schema, embed_dim, batch_size, max_seq_length,
+            normalize, text_buf, meta_buf,
+        )
+        text_buf, meta_buf = [], []
+        # rows_seen is on a row boundary here, so every chunk up to it is durable.
+        save_progress(
+            prog_path, completed_rows=rows_seen, total_written=total_written,
+            parquet_path=parquet_path, parquet_size=parquet_size, table_name=table_name,
+        )
+        pbar.set_postfix(chunks=f"{total_written:,}", refresh=False)
 
-    # Final flush.
-    total_written += flush_buffer(
-        model, table, schema, embed_dim, batch_size, max_seq_length,
-        normalize, text_buf, meta_buf,
-    )
+    pbar = tqdm(total=target_rows, initial=skip_rows, desc="rows", unit="row",
+                dynamic_ncols=True)
+    try:
+        for record_batch in pf.iter_batches(batch_size=read_batch_size):
+            n_in_batch = record_batch.num_rows
+            # Fast-skip whole record batches that fall entirely before the
+            # resume point — avoids materializing them to Python at all.
+            if rows_seen + n_in_batch <= skip_rows:
+                rows_seen += n_in_batch
+                del record_batch
+                continue
+
+            rows = record_batch.to_pylist()
+            del record_batch
+            for row in rows:
+                if rows_seen < skip_rows:        # tail of a partially-skipped batch
+                    rows_seen += 1
+                    continue
+                if limit_rows and rows_seen >= limit_rows:
+                    stop = True
+                    break
+
+                rows_seen += 1
+                # Buffer this whole row's chunks before considering a flush, so
+                # flushes always land on a row boundary (checkpoint stays exact).
+                for text, meta in iter_chunks(row, sections, min_chars):
+                    text_buf.append(text)
+                    meta_buf.append(meta)
+                pbar.update(1)
+
+                if len(text_buf) >= flush_size:
+                    do_flush()
+
+            del rows
+            gc.collect()
+            if stop:
+                break
+
+        # Final flush of whatever remains.
+        do_flush()
+    finally:
+        pbar.close()
 
     elapsed = time.time() - start
-    print(f"\nDone. Processed {rows_seen:,} company rows.")
-    print(f"Wrote {total_written:,} embedded chunks in {elapsed:.1f}s.")
+    processed = rows_seen - skip_rows
+    print(f"\nDone. Processed {processed:,} company rows this run "
+          f"(through row {rows_seen:,}).")
+    print(f"Wrote {total_written:,} embedded chunks total in {elapsed:.1f}s.")
     print(f"Table '{table_name}' now has {table.count_rows():,} rows ({embed_dim}-dim vectors).")
     return 0
 
